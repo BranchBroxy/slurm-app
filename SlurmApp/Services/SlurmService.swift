@@ -142,7 +142,7 @@ actor SlurmService {
     /// compute node via `srun --overlap --jobid=<id>`. `srun --overlap` joins
     /// an existing allocation without claiming new resources, so it does NOT
     /// modify cluster state (matches slurm-tui's `get_job_gpu_stats`).
-    func liveGpuStats(jobId: String) async throws -> [GpuStat] {
+    func liveGpuStats(jobId: String, priority: SSHCommandPriority = .poll) async throws -> [GpuStat] {
         // srun --jobid wants the RUNNING task's bare numeric id. For an array
         // element ("172551_1") the base ArrayJobId ("172551") is the *pending*
         // part — srun would say "Job is pending execution". So resolve the real
@@ -163,7 +163,7 @@ actor SlurmService {
         // srun isn't on the read-only allow-list, daher executeWrite — aber als
         // 5-s-Poll explizit mit Poll-Priorität, damit echte Nutzeraktionen
         // (scancel & Co.) nicht hinter dem GPU-Tick anstehen.
-        let out = try await client.executeWrite(cmd, priority: .poll)
+        let out = try await client.executeWrite(cmd, priority: priority)
         let stats = SlurmParser.parseNvidiaSmi(out)
         // No parseable GPU rows but the command did print something → that's an
         // srun/nvidia-smi error message. Bubble it up so the UI shows it rather

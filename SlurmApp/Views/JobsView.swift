@@ -24,7 +24,7 @@ final class JobsViewModel: ObservableObject {
     // `filtered()` + the filter-bar stats used to be recomputed many times per
     // render and on every keystroke (O(n) each, several passes). They are now
     // computed ONCE whenever an input actually changes and served from a cache.
-    struct Stats: Equatable { var running = 0; var pending = 0; var gpus = 0 }
+    struct Stats: Equatable { var running = 0; var pending = 0; var gpus = 0; var cpus = 0; var memMB = 0.0; var vramGB = 0 }
     private(set) var filteredJobs: [Job] = []
     private(set) var stats = Stats()
     /// Bumped on every recompute so the view's `visibleJobs` memo invalidates.
@@ -38,6 +38,17 @@ final class JobsViewModel: ObservableObject {
     @Published var quotasLoading: Bool = true
     private var lastHoursFetch: Date = .distantPast
     private var lastQuotaFetch: Date = .distantPast
+    /// Live-VRAM-Belegung der EIGENEN laufenden GPU-Jobs (Summe nvidia-smi).
+    /// 0 ⇒ keine Live-Daten (keine eigenen GPU-Jobs / noch nicht geladen) →
+    /// die Leiste zeigt dann die allokierte Kapazität als Fallback.
+    @Published var liveVramUsedMiB: Int = 0
+    @Published var liveVramTotalMiB: Int = 0
+    private var lastVramFetch: Date = .distantPast
+    private var fetchingVram = false
+    /// Default-Poll-Intervall für Live-VRAM (Sekunden); in den Einstellungen
+    /// überschreibbar (Key „vramPollInterval", 0 = aus). nvidia-smi je Job ist
+    /// teuer (srun pro Job, serielle SSH-Queue) → bewusst kein 10-s-Takt.
+    static let defaultVramInterval: TimeInterval = 45
     /// GPU hours come from a heavy `sreport` over a year of accounting — they
     /// barely move within half an hour. Auto-refresh at most this often; the
     /// ranking is cached to disk in between (and can be refreshed manually).
@@ -131,7 +142,18 @@ final class JobsViewModel: ObservableObject {
 
         var s = Stats()
         for j in base {
-            if j.isRunning { s.running += 1; s.gpus += j.gpus }
+            if j.isRunning {
+                s.running += 1
+                s.gpus += j.gpus
+                s.cpus += j.cpus
+                s.memMB += j.memoryMB
+                // Belegtes VRAM = GPUs × VRAM/GPU der Partition. Wie GPU/CPU/RAM
+                // eine ALLOKATIONS-Summe (best effort: unbekannte Partitionen
+                // zählen 0), keine Live-Nutzung via nvidia-smi.
+                if j.gpus > 0, let v = GpuSpecs.vramGB(partition: j.partition, gresType: nil) {
+                    s.vramGB += j.gpus * v
+                }
+            }
             else if j.isPending { s.pending += 1 }
         }
         stats = s
@@ -274,6 +296,20 @@ final class JobsViewModel: ObservableObject {
         if diskQuotas.isEmpty || now.timeIntervalSince(lastQuotaFetch) > 300 {
             await reloadDiskQuotas()
         }
+        // Live-VRAM separat & langsam: fire-and-forget, damit die vielen srun-
+        // nvidia-smi-Aufrufe den 10-s-Job-Takt nicht blockieren. lastVramFetch
+        // sofort setzen → kein doppeltes Anstoßen im selben Fenster. Intervall
+        // aus den Einstellungen; 0 = aus → Live-Anzeige leeren.
+        let vramInterval = UserDefaults.standard.object(forKey: "vramPollInterval") as? Double
+            ?? Self.defaultVramInterval
+        if vramInterval > 0 {
+            if now.timeIntervalSince(lastVramFetch) > vramInterval {
+                lastVramFetch = now
+                Task { await reloadLiveVram() }
+            }
+        } else if liveVramTotalMiB != 0 {
+            liveVramUsedMiB = 0; liveVramTotalMiB = 0
+        }
     }
 
     /// (Re)load the GPU-hours ranking and refresh the on-disk cache. Called on
@@ -320,6 +356,44 @@ final class JobsViewModel: ObservableObject {
             self.diskQuotas = q
             self.lastQuotaFetch = Date()
             persistQuotaCache()
+        }
+    }
+
+    /// Summiert die Live-VRAM-Belegung der eigenen laufenden GPU-Jobs via
+    /// `nvidia-smi` (srun --overlap). Pro DISTINKTEM Knoten nur EIN Aufruf
+    /// (dedupe über `node`), damit ein Knoten nicht doppelt zählt. Bewusst
+    /// best-effort: unbekannte/fehlgeschlagene Knoten fehlen, geteilte Knoten
+    /// zeigen alle ihre GPUs (auch fremde) — daher als „eigene GPU-Jobs"
+    /// gelabelt. Läuft nur, wenn es überhaupt eigene GPU-Jobs gibt.
+    func reloadLiveVram() async {
+        guard !fetchingVram,
+              let slurm = appState?.slurm,
+              let me = appState?.credentials?.username else { return }
+        // Pro EIGENEM laufenden GPU-Job einzeln nvidia-smi (srun --overlap):
+        // unter Slurm-cgroup-Isolation (ConstrainDevices) zeigt nvidia-smi im
+        // Step nur die GPUs DIESES Jobs → sauberes Summieren je Job/GPU, ohne
+        // Knoten-Dedupe und ohne fremde GPUs. Live ist damit prinzipbedingt
+        // EIGENE-Jobs-Scope (in fremde Allokationen kann srun nicht --overlap-en).
+        let gpuJobs = allJobs.filter { $0.user == me && $0.isRunning && $0.gpus > 0 }
+        guard !gpuJobs.isEmpty else {
+            if liveVramTotalMiB != 0 { liveVramUsedMiB = 0; liveVramTotalMiB = 0 }
+            return
+        }
+        fetchingVram = true
+        defer { fetchingVram = false }
+        var used = 0, total = 0
+        for j in gpuJobs {
+            if Task.isCancelled { return }
+            // .background: darf den 10-s-Job-Poll (squeue → GPU-Belegung) NIE
+            // ausbremsen — der srun-Schwarm füllt nur die Lücken dazwischen.
+            if let stats = try? await slurm.liveGpuStats(jobId: j.jobId, priority: .background) {
+                for s in stats { used += s.memoryUsedMiB; total += s.memoryTotalMiB }
+            }
+        }
+        // Nur bei Erfolg übernehmen (transiente srun-Fehler sonst → Flackern).
+        if total > 0 {
+            liveVramUsedMiB = used
+            liveVramTotalMiB = total
         }
     }
 
@@ -497,6 +571,7 @@ struct JobsView: View {
     @State private var showGpuHoursSheet: Bool = false
     @State private var showNodesSheet: Bool = false
     @State private var showHelp: Bool = false
+    @State private var showSlurmy: Bool = false
     /// Full-size log modal raised from the detail pane (click or Space).
     /// Holds the live JobDetailViewModel so it streams in Follow-mode.
     @State private var logModal: LogModalSelection? = nil
@@ -536,6 +611,11 @@ struct JobsView: View {
     /// iOS: Cluster-Inspector als Sheet, startet geschlossen (entkoppelt vom
     /// persistierten macOS-Pane-Zustand `inspectorOpen`). Auf macOS ungenutzt.
     @State private var showInspectorSheet = false
+
+    // Pro-Karte einklappbar (Cluster-Info): persistiert je Karte, 1-Zeilen-Kopf.
+    @AppStorage("clusterCard.gpu.collapsed") private var gpuCardCollapsed = false
+    @AppStorage("clusterCard.quotas.collapsed") private var quotasCardCollapsed = false
+    @AppStorage("clusterCard.hours.collapsed") private var gpuHoursCardCollapsed = false
 
     /// One of the four navigable regions inside the Jobs section.
     /// `Tab` / `⇧Tab` cycles between them; arrow keys then operate inside
@@ -598,6 +678,9 @@ struct JobsView: View {
         #endif
         .glassModal(isPresented: $showHelp, maxWidth: .infinity, maxHeight: .infinity) {
             HelpOverlayView()
+        }
+        .glassModal(isPresented: $showSlurmy, maxWidth: 460, maxHeight: 560) {
+            SlurmyShowcaseView()
         }
         .glassModal(item: $logModal) { sel in
             LogDetailSheetView(vm: sel.vm, stream: sel.stream)
@@ -1063,6 +1146,7 @@ struct JobsView: View {
                 .foregroundColor(vm.allUsers ? Theme.accent : Theme.textSecondary)
         }
         .font(.caption)
+        .padding(.leading, 6)   // sonst klebt das Personen-Icon am Glasrand
         .help("Eigene Jobs ↔ alle Nutzer (u)")
     }
     #endif
@@ -1122,23 +1206,28 @@ struct JobsView: View {
             allUsersToggle
             Button { Task { await vm.refresh() } } label: {
                 Image(systemName: "arrow.clockwise")
+                    .font(.caption)
                     .symbolEffect(.pulse, options: .repeating, isActive: vm.loading)
             }
                 .keyboardShortcut(Shortcut.refresh.key, modifiers: Shortcut.refresh.modifiers)
                 .help("Aktualisieren (r)")
             // Interaktive Session = srun --pty in Terminal.app → nur macOS.
-            Button { showInteractive.toggle() } label: { Image(systemName: "terminal") }
+            Button { showInteractive.toggle() } label: { Image(systemName: "terminal").font(.caption) }
                 .keyboardShortcut(Shortcut.interactiveSession.key, modifiers: Shortcut.interactiveSession.modifiers)
                 .help("Interaktive Session (i — toggle)")
-            Button { showSubmit.toggle() } label: { Image(systemName: "plus.circle.fill") }
+            Button { showSubmit.toggle() } label: { Image(systemName: "plus.circle.fill").font(.caption) }
                 .keyboardShortcut(Shortcut.submitJob.key, modifiers: Shortcut.submitJob.modifiers)
                 .help("sbatch (n — toggle)")
-            Button { showNodesSheet.toggle() } label: { Image(systemName: "server.rack") }
+            Button { showNodesSheet.toggle() } label: { Image(systemName: "server.rack").font(.caption) }
                 .keyboardShortcut(Shortcut.nodesOverview.key, modifiers: Shortcut.nodesOverview.modifiers)
                 .help("Knoten-Übersicht (G — toggle)")
-            Button { showHelp.toggle() } label: { Image(systemName: "questionmark.circle") }
+            Button { showHelp.toggle() } label: { Image(systemName: "questionmark.circle").font(.caption) }
                 .keyboardShortcut(Shortcut.help.key, modifiers: Shortcut.help.modifiers)
                 .help("Tastatur-Shortcuts (h — toggle)")
+            Button { showSlurmy.toggle() } label: {
+                Image("SlurmyMascot").resizable().scaledToFit().frame(width: 18, height: 18)
+            }
+                .help("Slurmy ansehen")
         }
         if dashboardEnabled {
             ToolbarItem(placement: .primaryAction) {
@@ -1146,6 +1235,7 @@ struct JobsView: View {
                     editingDashboard.toggle()
                 } label: {
                     Image(systemName: editingDashboard ? "checkmark.circle.fill" : "slider.horizontal.3")
+                        .font(.caption)
                         .foregroundColor(editingDashboard ? Theme.accent : Theme.textPrimary)
                 }
                 .help(editingDashboard ? "Layout fertig bearbeiten" : "Layout bearbeiten (verschieben/skalieren)")
@@ -1156,7 +1246,7 @@ struct JobsView: View {
                     withMotion { inspectorOpen.toggle() }
                 } label: {
                     Image(systemName: "sidebar.right")
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.caption)
                         .foregroundColor(inspectorOpen ? Theme.accent : Theme.textPrimary)
                         .symbolVariant(inspectorOpen ? .fill : .none)
                 }
@@ -1210,7 +1300,7 @@ struct JobsView: View {
     /// Any modal is on top of the table — silence Job-section shortcuts so
     /// they don't fire while the user is reading help / submitting / etc.
     private var anyModalOpen: Bool {
-        var open = showHelp || showSubmit || showInteractive || showGpuHoursSheet
+        var open = showHelp || showSlurmy || showSubmit || showInteractive || showGpuHoursSheet
             || sheetPartition != nil || logModal != nil || showNodesSheet
         #if os(iOS)
         // The cluster inspector is a sheet on iOS — its presence must also
@@ -1718,6 +1808,7 @@ struct JobsView: View {
         if sheetPartition  != nil { sheetPartition = nil; return }
         if showGpuHoursSheet      { showGpuHoursSheet = false; return }
         if showHelp               { showHelp = false; return }
+        if showSlurmy             { showSlurmy = false; return }
         if showSubmit             { showSubmit = false; return }
         if showInteractive        { showInteractive = false; return }
     }
@@ -1796,6 +1887,7 @@ struct JobsView: View {
         if sheetPartition != nil { sheetPartition = nil; return }
         if showGpuHoursSheet { showGpuHoursSheet = false; return }
         if showHelp { showHelp = false; return }
+        if showSlurmy { showSlurmy = false; return }
         if showSubmit { showSubmit = false; return }
         if showInteractive { showInteractive = false; return }
         if !marked.isEmpty { marked = []; return }
@@ -2064,36 +2156,25 @@ struct JobsView: View {
         }
     }
 
-    /// Gemessene natürliche Höhe der GPU-Belegungs-Karte (s. clusterInfoColumn).
-    @State private var gpuCardNaturalH: CGFloat = 320
-
     /// Kombinierte Cluster-Spalte (klassischer Inspector UND .cluster-Widget):
-    /// Die GPU-Belegung bekommt ihre NATÜRLICHE Höhe, damit alle Partitionen
-    /// sichtbar sind (Deckel: 60 % der Spalte als Schutz vor Riesen-Clustern,
-    /// dann scrollt sie intern); Disk-Quotas und GPU-Stunden teilen sich den
-    /// restlichen Platz gleichmäßig und scrollen jeweils in sich.
+    /// GPU-Belegung wird IMMER komplett ausgeklappt (natürliche Höhe, alle
+    /// Partitionen sichtbar, kein interner Scroll); Disk-Quotas und GPU-Stunden
+    /// teilen sich den restlichen Platz gleichmäßig und scrollen jeweils in sich.
+    /// Jede Karte lässt sich per Chevron im Kopf auf eine 1-Zeile einklappen.
     private var clusterInfoColumn: some View {
-        GeometryReader { geo in
-            VStack(spacing: 12) {
-                ScrollView {
-                    gpuAllocationCardView
-                        .frame(maxWidth: .infinity)
-                        .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) {
-                            gpuCardNaturalH = $0
-                        }
-                }
-                .frame(maxHeight: min(gpuCardNaturalH, geo.size.height * 0.6))
-                ScrollView {
-                    diskQuotasCardView
-                        .frame(maxWidth: .infinity)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                ScrollView {
-                    gpuHoursCardView
-                        .frame(maxWidth: .infinity)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        VStack(spacing: 12) {
+            gpuAllocationCardView
+                .frame(maxWidth: .infinity)
+            ScrollView {
+                diskQuotasCardView
+                    .frame(maxWidth: .infinity)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            ScrollView {
+                gpuHoursCardView
+                    .frame(maxWidth: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -2109,7 +2190,8 @@ struct JobsView: View {
         return GpuAllocationStrip(
             usage: vm.gpuUsage,
             isLoading: !vm.initialFetchDone,
-            focusedPartition: focusedPartition
+            focusedPartition: focusedPartition,
+            collapsed: $gpuCardCollapsed
         ) { name in
             sheetPartition = PartitionSelection(name: name)
             Task { await vm.loadPartition(name) }
@@ -2117,7 +2199,7 @@ struct JobsView: View {
     }
 
     private var diskQuotasCardView: some View {
-        DiskQuotasCard(quotas: vm.diskQuotas, isLoading: vm.quotasLoading)
+        DiskQuotasCard(quotas: vm.diskQuotas, isLoading: vm.quotasLoading, collapsed: $quotasCardCollapsed)
     }
 
     private var gpuHoursCardView: some View {
@@ -2128,7 +2210,8 @@ struct JobsView: View {
             isLoading: vm.hoursLoading,
             isFocused: gpuHoursFocused,
             onOpenFullView: { showGpuHoursSheet = true },
-            onRefresh: { Task { await vm.reloadGpuHours(force: true) } }
+            onRefresh: { Task { await vm.reloadGpuHours(force: true) } },
+            collapsed: $gpuHoursCardCollapsed
         )
     }
 
@@ -2192,36 +2275,35 @@ struct JobsView: View {
         HStack(spacing: 12) {
             HStack(spacing: 6) {
                 Circle().fill(Theme.success).frame(width: 8, height: 8)
-                Text("\(running)").foregroundColor(Theme.textPrimary)
-                    .contentTransition(.numericText())
+                RollingNumber(value: running)
                 Text("laufend").foregroundColor(Theme.textSecondary)
             }
             HStack(spacing: 6) {
                 Circle().fill(Theme.warning).frame(width: 8, height: 8)
-                Text("\(pending)").foregroundColor(Theme.textPrimary)
-                    .contentTransition(.numericText())
+                RollingNumber(value: pending)
                 Text("wartend").foregroundColor(Theme.textSecondary)
             }
-            HStack(spacing: 6) {
-                Image(systemName: "cpu").foregroundColor(Theme.purple)
-                Text("\(gpus) GPU").foregroundColor(Theme.textPrimary)
-                    .contentTransition(.numericText())
-            }
+            statItem("cpu.fill", Theme.purple, gpus, " GPU")
+            statItem("cpu", Theme.warning, cpus, " CPU")
+            statItem("memorychip", Theme.cyan, ramGB, "G RAM")
+            vramItem
             Spacer()
             if !marked.isEmpty {
-                Text("\(marked.count) markiert")
-                    .foregroundColor(Theme.accent)
-                    .contentTransition(.numericText())
-                    .transition(.opacity)
+                HStack(spacing: 4) {
+                    RollingNumber(value: marked.count, color: Theme.accent)
+                    Text("markiert").foregroundColor(Theme.accent)
+                }
+                .transition(.opacity)
             }
             if vm.runningOnly {
                 Text("nur laufende")
                     .foregroundColor(Theme.warning)
                     .transition(.opacity)
             }
-            Text("\(filteredCount) sichtbar")
-                .foregroundColor(Theme.textSecondary)
-                .contentTransition(.numericText())
+            HStack(spacing: 4) {
+                RollingNumber(value: filteredCount, color: Theme.textSecondary)
+                Text("sichtbar").foregroundColor(Theme.textSecondary)
+            }
         }
         .font(.caption.monospacedDigit())
         .padding(.horizontal, 14).padding(.vertical, 8)
@@ -2229,7 +2311,71 @@ struct JobsView: View {
         // Count-ups roll smoothly as the cluster changes (honours Reduce Motion).
         .motion(Motion.smooth, value: vm.stats)
         .motion(Motion.smooth, value: filteredCount)
+        .motion(Motion.smooth, value: vm.liveVramTotalMiB)
+        .motion(Motion.smooth, value: vm.allUsers)
         .motion(Motion.snappy, value: marked.isEmpty)
+    }
+
+    /// Ein Ressourcen-Chip: Icon + rollende Zahl + Einheit (z. B. „148 CPU").
+    private func statItem(_ icon: String, _ color: Color, _ value: Int, _ unit: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon).foregroundColor(color)
+            HStack(spacing: 0) {
+                RollingNumber(value: value)
+                Text(unit).foregroundColor(Theme.textSecondary)
+            }
+        }
+    }
+
+    /// VRAM-Chip: Live-Belegung der eigenen GPU-Jobs (nvidia-smi) als
+    /// „belegt/gesamt", sonst die allokierte Kapazität als Fallback.
+    @ViewBuilder
+    private var vramItem: some View {
+        let hasLive = vm.liveVramTotalMiB > 0
+        // Eigene Live-Auslastung (belegt von gesamt) — färbt Icon + „belegt".
+        let liveRatio = hasLive ? Double(vm.liveVramUsedMiB) / Double(vm.liveVramTotalMiB) : 0
+        let liveColor = Theme.utilizationColor(liveRatio)
+        let usedGB = vm.liveVramUsedMiB / 1024
+
+        if !vm.allUsers {
+            // EIGENE Ansicht: Live „belegt/gesamt", sonst allokierte Kapazität.
+            if hasLive {
+                HStack(spacing: 5) {
+                    Image(systemName: "memorychip.fill").foregroundColor(liveColor)
+                    HStack(spacing: 0) {
+                        RollingNumber(value: usedGB, color: liveColor)
+                        Text("/").foregroundColor(Theme.textSecondary)
+                        RollingNumber(value: vm.liveVramTotalMiB / 1024, color: Theme.textSecondary)
+                        Text("G VRAM").foregroundColor(Theme.textSecondary)
+                    }
+                }
+                .help("Live-VRAM-Belegung deiner laufenden GPU-Jobs (nvidia-smi)")
+                .transition(.opacity)
+            } else if vramGB > 0 {
+                statItem("memorychip.fill", Theme.purple, vramGB, "G VRAM")
+                    .help("Allokierte VRAM-Kapazität (Live folgt)")
+                    .transition(.opacity)
+            }
+        } else if vramGB > 0 {
+            // ALLE Jobs: allokierte Gesamt-Kapazität; falls eigene Live-Daten da
+            // sind, zusätzlich „X belegt ·" davor (eigene Nutzung im Cluster).
+            HStack(spacing: 5) {
+                Image(systemName: "memorychip.fill")
+                    .foregroundColor(hasLive ? liveColor : Theme.purple)
+                HStack(spacing: 0) {
+                    if hasLive {
+                        RollingNumber(value: usedGB, color: liveColor)
+                        Text(" belegt · ").foregroundColor(Theme.textSecondary)
+                    }
+                    RollingNumber(value: vramGB, color: Theme.textSecondary)
+                    Text("G VRAM").foregroundColor(Theme.textSecondary)
+                }
+            }
+            .help(hasLive
+                  ? "Eigene Live-Belegung · allokierte VRAM-Kapazität aller Jobs"
+                  : "Allokierte VRAM-Kapazität aller Jobs")
+            .transition(.opacity)
+        }
     }
 
     private var table: some View {
@@ -2416,6 +2562,9 @@ struct JobsView: View {
     private var running: Int { vm.stats.running }
     private var pending: Int { vm.stats.pending }
     private var gpus: Int { vm.stats.gpus }
+    private var cpus: Int { vm.stats.cpus }
+    private var ramGB: Int { Int(vm.stats.memMB / 1024) }
+    private var vramGB: Int { vm.stats.vramGB }
     private var filteredCount: Int { vm.filteredJobs.count }
 
     /// Plausibly-shaped job rows used while the first squeue fetch is in

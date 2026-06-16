@@ -34,10 +34,14 @@ enum SSHError: LocalizedError {
 /// Poll-Kommandos werden von Nutzeraktionen überholt — ein scancel muss nicht
 /// hinter einem ganzen Poll-Rückstau (srun/sstat/tail) anstehen.
 enum SSHCommandPriority: Sendable {
-    /// Hintergrund-Polls (Jobs ~10 s, GPU ~5 s, Logs, Quota) — FIFO.
+    /// Niedrigste Stufe: teure Massen-Polls (Live-VRAM = ein srun-nvidia-smi PRO
+    /// GPU-Job). Läuft IMMER hinter den normalen Polls, damit der 10-s-Job-Poll
+    /// (und damit GPU-Belegung) nie hinter dem srun-Schwarm verhungert.
+    case background
+    /// Hintergrund-Polls (Jobs ~10 s, GPU ~5 s, Logs, Quota) — FIFO, vor background.
     case poll
     /// Vom Nutzer ausgelöste Aktion (scancel, Hold, QoS-Änderung, sbatch, …) —
-    /// wird vor alle noch nicht gestarteten Poll-Kommandos einsortiert.
+    /// wird vor alle noch nicht gestarteten Poll-/Background-Kommandos einsortiert.
     case userInitiated
 }
 
@@ -235,10 +239,15 @@ final class SSHClient: @unchecked Sendable {
         stateLock.lock()
         switch priority {
         case .userInitiated:
-            // Hinter bereits wartende Nutzeraktionen, vor alle Polls.
-            let idx = pendingCommands.firstIndex { $0.priority == .poll } ?? pendingCommands.count
+            // Hinter bereits wartende Nutzeraktionen, vor alle Poll-/Background-Kommandos.
+            let idx = pendingCommands.firstIndex { $0.priority == .poll || $0.priority == .background } ?? pendingCommands.count
             pendingCommands.insert((priority, run), at: idx)
         case .poll:
+            // Vor wartende Background-Kommandos (sonst staut der VRAM-srun-Schwarm
+            // den Job-Poll zu), hinter andere Polls/Nutzeraktionen.
+            let idx = pendingCommands.firstIndex { $0.priority == .background } ?? pendingCommands.count
+            pendingCommands.insert((priority, run), at: idx)
+        case .background:
             pendingCommands.append((priority, run))
         }
         stateLock.unlock()

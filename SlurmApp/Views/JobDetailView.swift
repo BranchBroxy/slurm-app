@@ -1320,14 +1320,7 @@ struct LogDetailSheetView: View {
     }
 
     private var closeButton: some View {
-        Button(action: dismiss) {
-            Image(systemName: "xmark")
-                .font(.title3)
-                .frame(width: 32, height: 32)
-        }
-        .slurmyGlassCircleButton()
-        .keyboardShortcut(.cancelAction)
-        .help("Schliessen (Esc / Leertaste)")
+        ModalCloseButton(help: "Schliessen (Esc / Leertaste)", action: dismiss)
     }
 
     private var logBody: some View {

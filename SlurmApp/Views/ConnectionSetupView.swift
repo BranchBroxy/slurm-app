@@ -371,7 +371,10 @@ struct ConnectionSetupView: View {
                     .foregroundColor(Theme.textPrimary)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
             }
-            .disabled(testing || !canSubmit)
+            // Bewusst NICHT von canSubmit gesperrt: ein Klick soll IMMER eine
+            // Rückmeldung geben (sonst wirkt der Button bei leeren Feldern tot).
+            // Die Validierung passiert in testConnection().
+            .disabled(testing)
 
             Button {
                 Self.draftCreds = creds
@@ -380,16 +383,27 @@ struct ConnectionSetupView: View {
                 Label("Verbinden", systemImage: "bolt.fill")
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 12)
-                    .background(Theme.accent)
+                    .background(canSubmit ? Theme.accent : Theme.accent.opacity(0.4))
                     .foregroundColor(Theme.onAccent)
                     .clipShape(RoundedRectangle(cornerRadius: 10))
             }
             .disabled(!canSubmit)
 
+            // Sichtbar erklären, warum „Verbinden" (noch) ausgegraut ist —
+            // sonst sieht man der leeren Eingabe den Grund nicht an.
+            if !canSubmit {
+                Text("Bitte Host, Benutzer und Zugangsdaten ausfüllen.")
+                    .font(.caption)
+                    .foregroundColor(Theme.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .transition(.opacity)
+            }
+
             if case .failed(let msg) = appState.connectionStatus {
                 ErrorBanner(message: msg)
             }
         }
+        .motion(Motion.smooth, value: canSubmit)
     }
 
     private var canSubmit: Bool {
@@ -400,6 +414,12 @@ struct ConnectionSetupView: View {
     }
 
     private func testConnection() async {
+        // Klick gibt immer Feedback — bei unvollständiger Eingabe sofort sagen,
+        // was fehlt, statt still nichts zu tun.
+        guard canSubmit else {
+            testResult = String(localized: "✗ Bitte Host, Benutzer und Zugangsdaten ausfüllen.")
+            return
+        }
         testing = true; defer { testing = false }
         testResult = String(localized: "Verbinde mit \(creds.host):\(creds.port)…")
         do {

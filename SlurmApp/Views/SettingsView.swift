@@ -8,6 +8,9 @@ struct SettingsView: View {
     @State private var showForgetConfirm = false
     @AppStorage("jobsDashboardEnabled") private var dashboardEnabled = false
     @AppStorage("runningJobsFirst") private var runningJobsFirst = false
+    /// Poll-Intervall (Sekunden) für die Live-VRAM-Anzeige in der Jobs-Leiste;
+    /// 0 = aus. Wird von JobsViewModel.refresh() gelesen.
+    @AppStorage("vramPollInterval") private var vramPollInterval: Double = 45
     #if os(iOS)
     @Environment(\.horizontalSizeClass) private var hSizeClass
     #endif
@@ -492,6 +495,25 @@ struct SettingsView: View {
             .tint(Theme.accent)
 
             Text("Sortiert laufende Jobs (running) unabhängig von der Spaltensortierung an den Anfang der Liste.")
+                .font(.caption)
+                .foregroundColor(Theme.textSecondary)
+
+            Divider().padding(.vertical, 2)
+
+            Picker(selection: $vramPollInterval) {
+                Text("Aus").tag(0.0)
+                Text("15 s").tag(15.0)
+                Text("30 s").tag(30.0)
+                Text("45 s").tag(45.0)
+                Text("60 s").tag(60.0)
+                Text("120 s").tag(120.0)
+            } label: {
+                Text("Live-VRAM aktualisieren").foregroundColor(Theme.textPrimary)
+            }
+            .pickerStyle(.menu)
+            .tint(Theme.accent)
+
+            Text("Holt die echte VRAM-Belegung deiner laufenden GPU-Jobs per nvidia-smi (ein Aufruf pro Job, über die SSH-Verbindung). Höhere Intervalle schonen die Verbindung; „Aus“ blendet die Live-Anzeige aus und zeigt nur die allokierte Kapazität.")
                 .font(.caption)
                 .foregroundColor(Theme.textSecondary)
         }

@@ -105,14 +105,7 @@ struct GpuHoursSheetView: View {
                 .disabled(loading)
                 .help("Aktualisieren")
 
-                Button(action: dismiss) {
-                    Image(systemName: "xmark")
-                        .font(.title3)
-                        .frame(width: 32, height: 32)
-                }
-                .slurmyGlassCircleButton()
-                .keyboardShortcut(.cancelAction)
-                .help("Schliessen (Esc)")
+                ModalCloseButton(action: dismiss)
             }
         }
         .padding(.horizontal, 24).padding(.vertical, 18)

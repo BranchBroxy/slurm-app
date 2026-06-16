@@ -115,14 +115,7 @@ struct PartitionSheetView: View {
                 .slurmyGlassCircleButton()
                 .help("Aktualisieren")
 
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
-                        .font(.title3)
-                        .frame(width: 32, height: 32)
-                }
-                .slurmyGlassCircleButton()
-                .keyboardShortcut(.cancelAction)
-                .help("Schliessen (Esc)")
+                ModalCloseButton(action: onClose)
             }
         }
         .padding(.horizontal, 24)

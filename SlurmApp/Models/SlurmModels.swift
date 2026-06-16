@@ -156,6 +156,16 @@ enum GpuSpecs {
         if let v = typeVRAM[rawType.lowercased()] { return v }
         return vramGB(for: rawType).map { "\($0) GB" }
     }
+
+    /// Per-GPU VRAM in GB resolved from the partition table (wins) or a gres
+    /// type. Used to sum *allocated* VRAM capacity across jobs — nil when the
+    /// partition is unknown (caller then skips that job's GPUs).
+    static func vramGB(partition: String?, gresType: String?) -> Int? {
+        if let p = partition, let hit = partitionInfo[p],
+           let n = Int(hit.vram.prefix(while: { $0.isNumber })) { return n }
+        if let t = gresType { return vramGB(for: t) }
+        return nil
+    }
 }
 
 struct PartitionNode: Identifiable, Hashable {

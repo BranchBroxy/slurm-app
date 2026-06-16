@@ -42,14 +42,7 @@ struct HelpOverlayView: View {
                     .foregroundStyle(.primary)
             }
             Spacer()
-            Button(action: dismiss) {
-                Image(systemName: "xmark")
-                    .font(.title3)
-                    .frame(width: 32, height: 32)
-            }
-            .slurmyGlassCircleButton()
-            .keyboardShortcut(.cancelAction)
-            .help("Schliessen (Esc)")
+            ModalCloseButton(action: dismiss)
         }
         .padding(.horizontal, 24).padding(.vertical, 18)
     }
@@ -99,5 +92,51 @@ struct HelpOverlayView: View {
                 .foregroundStyle(.primary)
             Spacer(minLength: 0)
         }
+    }
+}
+
+/// Verspielter „Slurmy ansehen"-Dialog — zeigt das Maskottchen gross, im
+/// gleichen Glas-Modal-Stil wie das Shortcut-Overlay.
+struct SlurmyShowcaseView: View {
+    @Environment(\.glassModalDismiss) private var dismiss
+
+    private var appVersion: String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
+        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String
+        return [v, b].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            HStack {
+                Spacer()
+                ModalCloseButton(action: dismiss)
+            }
+            Spacer(minLength: 0)
+            Image("SlurmyMascot")
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: 240, maxHeight: 240)
+                .shadow(color: Color(red: 0.16, green: 0.45, blue: 0.92).opacity(0.35),
+                        radius: 28, y: 8)
+                .accessibilityLabel("Slurmy-Maskottchen")
+            VStack(spacing: 6) {
+                Text("Slurmy")
+                    .font(.largeTitle.bold())
+                    .foregroundColor(Theme.textPrimary)
+                Text("Dein freundlicher Slurm-Begleiter")
+                    .font(.title3)
+                    .foregroundColor(Theme.textSecondary)
+                if !appVersion.isEmpty {
+                    Text("Version \(appVersion)")
+                        .font(.caption.monospaced())
+                        .foregroundColor(Theme.textSecondary)
+                        .padding(.top, 4)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

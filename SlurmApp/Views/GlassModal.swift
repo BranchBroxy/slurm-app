@@ -191,8 +191,11 @@ private struct GlassModalContainer<ModalContent: View>: View {
             .frame(maxWidth: maxWidth, maxHeight: maxHeight)
             .shadow(color: .black.opacity(0.35), radius: 32, x: 0, y: 16)
             .padding(40)
+            // Panel-Fläche schluckt Taps über ihr Glas-Backing + contentShape,
+            // ohne dass das Hintergrund-Dismiss feuert. KEIN .onTapGesture hier:
+            // das fing sonst den Klick auf den Schliessen-Button (X) ab, sodass
+            // er auf macOS nie auslöste.
             .contentShape(Rectangle())
-            .onTapGesture { /* swallow taps inside the panel */ }
         }
         // Esc closes via the underlying button shortcut; callers that need
         // an explicit close button get the `dismiss` closure inside their
@@ -214,5 +217,34 @@ extension EnvironmentValues {
     var glassModalDismiss: () -> Void {
         get { self[GlassModalDismissKey.self] }
         set { self[GlassModalDismissKey.self] = newValue }
+    }
+}
+
+// MARK: – Einheitlicher Schliessen-Button (X)
+
+/// Globaler Schliessen-Button (X) für alle Modals/Overlays: einheitliches
+/// Aussehen, Esc-Shortcut UND Hover-Feedback (Skalierung + Highlight) an EINER
+/// Stelle — statt den Button in jeder View zu duplizieren. Auf macOS/iPad mit
+/// Zeiger reagiert er beim Drüberfahren sichtbar; ohne Zeiger (iPhone) neutral.
+struct ModalCloseButton: View {
+    var help: LocalizedStringKey = "Schliessen (Esc)"
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "xmark")
+                .font(.title3.weight(.semibold))
+                .frame(width: 32, height: 32)
+                // Highlight-Kreis wächst beim Hover sanft ein.
+                .background(Circle().fill(Theme.textPrimary.opacity(hovering ? 0.14 : 0)))
+                .contentShape(Circle())
+        }
+        .slurmyGlassCircleButton()
+        .keyboardShortcut(.cancelAction)
+        .help(help)
+        .scaleEffect(hovering ? 1.08 : 1.0)
+        .motion(Motion.snappy, value: hovering)
+        .onHover { hovering = $0 }
     }
 }
