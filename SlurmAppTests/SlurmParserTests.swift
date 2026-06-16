@@ -68,6 +68,16 @@ final class SlurmParserTests: XCTestCase {
         XCTAssertEqual(parts.first?.totalGpus, 0)
     }
 
+    func testParsePartitionGres_MultiNodeSumsTotal() {
+        // 4 nodes each gpu:a100:8 in p1 → partition total 32 (per-node summed),
+        // NOT the per-node count of 8. One aggregated entry, no duplicate ids.
+        let text = "p1|gpu:a100:8\np1|gpu:a100:8\np1|gpu:a100:8\np1|gpu:a100:8"
+        let parts = SlurmParser.parsePartitionGres(text)
+        XCTAssertEqual(parts.count, 1)
+        XCTAssertEqual(parts[0].totalGpus, 32)
+        XCTAssertEqual(parts[0].gpuType, "a100")
+    }
+
     // MARK: – scontrol
 
     func testParseScontrol_JobFixture() throws {
@@ -109,6 +119,25 @@ final class SlurmParserTests: XCTestCase {
         XCTAssertEqual(stats.count, 1)
         XCTAssertEqual(stats[0].powerDrawW, 0)
         XCTAssertEqual(stats[0].powerLimitW, 0)
+    }
+
+    func testParseNvidiaSmi_MultiNodeKeepsUniqueIds() {
+        // Two nodes each report index 0 and 1 → ids must stay unique (slot).
+        let csv = "0,A,1,1,2,3,4,5\n1,A,1,1,2,3,4,5\n0,A,1,1,2,3,4,5\n1,A,1,1,2,3,4,5"
+        let stats = SlurmParser.parseNvidiaSmi(csv)
+        XCTAssertEqual(stats.count, 4)
+        XCTAssertEqual(Set(stats.map(\.id)).count, 4)
+    }
+
+    func testParseScontrol_PreservesValuesWithSpaces() {
+        // Command with arguments and a multi-word JobName must survive (the old
+        // space-split truncated them at the first space).
+        let text = "JobId=42 JobName=my long name Command=/path/run.sh arg1 arg2 Partition=p1"
+        let d = SlurmParser.parseScontrolKeyValue(text)
+        XCTAssertEqual(d["JobName"], "my long name")
+        XCTAssertEqual(d["Command"], "/path/run.sh arg1 arg2")
+        XCTAssertEqual(d["Partition"], "p1")
+        XCTAssertEqual(d["JobId"], "42")
     }
 
     func testParsePartitionNodes() {
@@ -167,6 +196,38 @@ final class SlurmParserTests: XCTestCase {
         XCTAssertEqual(SlurmParser.normalizeArrayJobId("167756_[0-4]"), "167756")
         XCTAssertEqual(SlurmParser.normalizeArrayJobId("167756_2"), "167756_2")
         XCTAssertEqual(SlurmParser.normalizeArrayJobId("12345"), "12345")
+    }
+
+    func testBaseNumericJobId() {
+        // srun --jobid needs a bare number for every array form.
+        XCTAssertEqual(SlurmParser.baseNumericJobId("172172_0"), "172172")
+        XCTAssertEqual(SlurmParser.baseNumericJobId("167756_[3]"), "167756")
+        XCTAssertEqual(SlurmParser.baseNumericJobId("167756_2"), "167756")
+        XCTAssertEqual(SlurmParser.baseNumericJobId("12345"), "12345")
+    }
+
+    // MARK: – Cross-partition node overview
+
+    func testParseAllNodesDedupesAndMergesPartitions() {
+        // ml1 appears in two partitions (p1, p2); ml2 only in p2; cpu1 has no GPU.
+        let out = """
+        ml1|gpu:a100:8(S:0-1)|mixed|256|512000|128000|p1
+        ml1|gpu:a100:8(S:0-1)|mixed|256|512000|128000|p2*
+        ml2|gpu:h200:8|idle|192|768000|700000|p2
+        cpu1|(null)|allocated|128|256000|4000|cpu
+        """
+        let nodes = SlurmParser.parseAllNodes(out)
+        XCTAssertEqual(nodes.count, 3, "duplicate per-partition rows collapse to one node")
+
+        let ml1 = nodes.first { $0.name == "ml1" }
+        XCTAssertEqual(ml1?.partitions, ["p1", "p2"], "partitions merged, '*' stripped")
+        XCTAssertEqual(ml1?.gpu.count, 8)
+        XCTAssertEqual(ml1?.gpu.type, "a100")
+        XCTAssertEqual(ml1?.freeMemoryMB, 128000)
+
+        let cpu1 = nodes.first { $0.name == "cpu1" }
+        XCTAssertEqual(cpu1?.gpuCount, 0, "(null) gres → no GPU")
+        XCTAssertEqual(cpu1?.partitions, ["cpu"])
     }
 
     // MARK: – Helper

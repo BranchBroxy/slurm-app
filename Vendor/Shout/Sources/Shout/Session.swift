@@ -25,7 +25,15 @@ class Session {
             libssh2_session_set_blocking(cSession, newValue)
         }
     }
-    
+
+    /// Milliseconds a blocking libssh2 call may wait before returning
+    /// LIBSSH2_ERROR_TIMEOUT. 0 (default) = wait forever. Used to keep a stalled
+    /// network read from hanging the SSH queue indefinitely.
+    var timeout: Int {
+        get { libssh2_session_get_timeout(cSession) }
+        set { libssh2_session_set_timeout(cSession, newValue) }
+    }
+
     init() throws {
         guard Session.initResult == 0 else {
             throw SSHError.genericError("libssh2_init failed")
@@ -41,6 +49,18 @@ class Session {
     func handshake(over socket: Socket) throws {
         let code = libssh2_session_handshake(cSession, socket.socketfd)
         try SSHError.check(code: code, session: cSession)
+    }
+
+    /// SHA-256 fingerprint of the server's host key, available after a successful
+    /// handshake. Returns the 32 raw hash bytes, or nil if libssh2 has no key yet.
+    /// Callers turn this into a pinned fingerprint for TOFU host-key verification.
+    func hostKeyHashSHA256() -> Data? {
+        guard let hashPtr = libssh2_hostkey_hash(cSession, LIBSSH2_HOSTKEY_HASH_SHA256) else {
+            return nil
+        }
+        return hashPtr.withMemoryRebound(to: UInt8.self, capacity: 32) {
+            Data(bytes: $0, count: 32)
+        }
     }
     
     func authenticate(username: String, privateKey: String, publicKey: String, passphrase: String?) throws {

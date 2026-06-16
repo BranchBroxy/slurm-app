@@ -12,14 +12,31 @@ actor SlurmService {
 
     // MARK: – Read operations
 
+    /// Proactively rebuild the SSH link (e.g. after the app returns from the
+    /// background) so the next command isn't stuck on a dead socket.
+    func reconnect() async {
+        await client.reconnect()
+    }
+
+    /// Markiert den SSH-Link als vermutlich tot (Sleep/Wake). Synchron und
+    /// nonisolated, damit der Hinweis sofort gesetzt wird — auch während ein
+    /// Poll-Kommando auf der seriellen SSH-Queue läuft oder wartet.
+    nonisolated func markLinkSuspect() {
+        client.markLinkSuspect()
+    }
+
     func ping() async throws -> String {
         try await client.ping()
     }
 
-    func fetchJobs(allUsers: Bool, currentUser: String) async throws -> [Job] {
+    /// `priority`: manuelle Refreshes (Toolbar, Pull-to-Refresh, nach Aktionen)
+    /// laufen als `.userInitiated` und springen damit in der seriellen
+    /// SSH-Queue vor wartende Poll-Ticks (srun/sstat/tail) — der 10s-Poll
+    /// bleibt beim Default `.poll`.
+    func fetchJobs(allUsers: Bool, currentUser: String, priority: SSHCommandPriority = .poll) async throws -> [Job] {
         let userFilter = allUsers ? "" : " -u \(shellEscape(currentUser))"
         let cmd = "squeue -h -o \"\(SlurmParser.squeueFormat)\"\(userFilter)"
-        let out = try await client.execute(cmd)
+        let out = try await client.execute(cmd, priority: priority)
         return SlurmParser.parseSqueue(out)
     }
 
@@ -28,8 +45,12 @@ actor SlurmService {
         return SlurmParser.parseSinfo(out)
     }
 
-    func fetchPartitionGpus() async throws -> [PartitionGpu] {
-        let out = try await client.execute("sinfo -h -o \"%P|%G\" | sort -u")
+    func fetchPartitionGpus(priority: SSHCommandPriority = .poll) async throws -> [PartitionGpu] {
+        // Per-NODE listing (`-N`): %G is a per-node GRES count, so the partition
+        // total is the SUM over its nodes. The old `-o "%P|%G" | sort -u` kept
+        // one line per partition and mistook the per-node count for the total
+        // (e.g. 8/8 shown when 20/32 were used on a 4-node partition).
+        let out = try await client.execute("sinfo -h -N -o \"%P|%G\"", priority: priority)
         return SlurmParser.parsePartitionGres(out)
     }
 
@@ -94,6 +115,23 @@ actor SlurmService {
         return SlurmParser.parsePartitionNodes(out)
     }
 
+    /// Full `scontrol show node <name>` key/values — the detailed per-node view
+    /// (Gres, GresUsed with GPU indices, AllocTRES/CfgTRES, State, memory, …).
+    func fetchNodeDetails(_ node: String) async throws -> [String: String] {
+        let out = try await client.execute("scontrol show node \(shellEscape(node))")
+        return SlurmParser.parseScontrolKeyValue(out)
+    }
+
+    /// Every compute node across all partitions, deduplicated by name (a node can
+    /// appear once per partition). Adds the partition column `%P` so each node
+    /// carries its partition memberships. Read-only `sinfo`.
+    func fetchAllNodes() async throws -> [ClusterNode] {
+        let out = try await client.execute(
+            "sinfo -h -N -o \"%N|%G|%T|%c|%m|%e|%P\""
+        )
+        return SlurmParser.parseAllNodes(out)
+    }
+
     /// Tail the last N lines of a log file. Read-only.
     func tailLog(path: String, lines: Int = 200) async throws -> String {
         let n = max(1, min(lines, 2000))
@@ -104,14 +142,58 @@ actor SlurmService {
     /// compute node via `srun --overlap --jobid=<id>`. `srun --overlap` joins
     /// an existing allocation without claiming new resources, so it does NOT
     /// modify cluster state (matches slurm-tui's `get_job_gpu_stats`).
-    func liveGpuStats(jobId: String) async throws -> [GpuStat] {
-        let baseId = SlurmParser.normalizeArrayJobId(jobId)
+    func liveGpuStats(jobId: String, priority: SSHCommandPriority = .poll) async throws -> [GpuStat] {
+        // srun --jobid wants the RUNNING task's bare numeric id. For an array
+        // element ("172551_1") the base ArrayJobId ("172551") is the *pending*
+        // part — srun would say "Job is pending execution". So resolve the real
+        // per-task JobId via scontrol; fall back to the base for plain jobs.
+        let baseId = await resolveSrunJobId(jobId)
+        // `2>&1` folds srun's diagnostics into stdout so a failed step (no GPU
+        // on the node, allocation gone, srun rejected) surfaces a readable
+        // message instead of an empty "(empty)" error. `timeout` keeps a slow
+        // or stuck srun from blocking the shared SSH queue forever — the live
+        // card refreshes every 5s, so a hang would otherwise freeze the app.
+        // `</dev/null` detaches srun from stdin: over a non-PTY SSH exec channel
+        // srun otherwise forwards (and waits on) a stdin that never reaches EOF,
+        // which stalls the step and trips a channel error on the libssh2 side.
         let cmd =
-            "srun --overlap --jobid=\(shellEscape(baseId)) " +
+            "timeout 20 srun --overlap --jobid=\(shellEscape(baseId)) " +
             "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit " +
-            "--format=csv,noheader,nounits"
-        let out = try await client.executeWrite(cmd) // srun isn't on the read-only allow-list
-        return SlurmParser.parseNvidiaSmi(out)
+            "--format=csv,noheader,nounits </dev/null 2>&1"
+        // srun isn't on the read-only allow-list, daher executeWrite — aber als
+        // 5-s-Poll explizit mit Poll-Priorität, damit echte Nutzeraktionen
+        // (scancel & Co.) nicht hinter dem GPU-Tick anstehen.
+        let out = try await client.executeWrite(cmd, priority: priority)
+        let stats = SlurmParser.parseNvidiaSmi(out)
+        // No parseable GPU rows but the command did print something → that's an
+        // srun/nvidia-smi error message. Bubble it up so the UI shows it rather
+        // than shimmering forever on an empty skeleton.
+        if stats.isEmpty {
+            let msg = out.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !msg.isEmpty {
+                throw SSHError.commandFailed(msg, -1)
+            }
+        }
+        return stats
+    }
+
+    /// Cache of array-element display id ("172551_1") → real numeric JobId.
+    private var resolvedSrunIds: [String: String] = [:]
+
+    /// The numeric JobId `srun --jobid` needs. Plain ids pass through; array
+    /// elements are resolved to the running task's real JobId via scontrol
+    /// (cached). Falls back to the base numeric id when scontrol can't help.
+    private func resolveSrunJobId(_ jobId: String) async -> String {
+        guard jobId.contains("_") else { return jobId }
+        if let cached = resolvedSrunIds[jobId] { return cached }
+        if let out = try? await client.execute("scontrol show job \(shellEscape(jobId))") {
+            let kv = SlurmParser.parseScontrolKeyValue(out)
+            if let real = kv["JobId"], Int(real) != nil {   // pure numeric → use it
+                resolvedSrunIds[jobId] = real
+                return real
+            }
+        }
+        return SlurmParser.baseNumericJobId(jobId)
     }
 
     /// MaxRSS of a running job via sstat. Returns memory in MB, or nil.
@@ -163,7 +245,12 @@ actor SlurmService {
         let yearEnd   = calendar.date(from: DateComponents(year: year, month: 12, day: 31)) ?? now
 
         let startStr = df.string(from: start ?? yearStart)
-        let endStr   = df.string(from: end ?? yearEnd)
+        // sreport's `end=` is EXCLUSIVE — passing the period's last day drops that
+        // whole day from the totals. Add one day so the requested end date is
+        // actually included.
+        let endDate = (end ?? yearEnd)
+        let endInclusive = calendar.date(byAdding: .day, value: 1, to: endDate) ?? endDate
+        let endStr   = df.string(from: endInclusive)
 
         let cmd =
             "sreport -n -P -t Hours -T gres/gpu cluster AccountUtilizationByUser " +
@@ -195,6 +282,15 @@ actor SlurmService {
 
     func cancelJob(_ jobId: String) async throws -> String {
         try await client.executeWrite("scancel \(shellEscape(jobId))")
+    }
+
+    /// Cancel several jobs in ONE `scancel` round-trip (scancel takes a job-id
+    /// list) instead of one SSH command per job. Each id is shell-escaped.
+    @discardableResult
+    func cancelJobs(_ jobIds: [String]) async throws -> String {
+        guard !jobIds.isEmpty else { return "" }
+        let ids = jobIds.map { shellEscape($0) }.joined(separator: " ")
+        return try await client.executeWrite("scancel \(ids)")
     }
 
     func updateJobQos(_ jobId: String, qos: String) async throws -> String {
@@ -231,9 +327,14 @@ actor SlurmService {
     // MARK: – Helpers
 
     private func shellEscape(_ s: String) -> String {
-        if s.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "/" || $0 == "." || $0 == "=" }) {
-            return s
-        }
+        // A value that begins with '-' must be quoted (and most call sites use
+        // key=value form) so it can't be mistaken for an option/flag by the
+        // remote binary (option injection). Empty also gets quoted so it stays
+        // a real, present argument.
+        let isBareWord = !s.isEmpty
+            && s.first != "-"
+            && s.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "/" || $0 == "." || $0 == "=" }
+        if isBareWord { return s }
         return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }

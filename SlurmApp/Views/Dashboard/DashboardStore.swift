@@ -1,0 +1,159 @@
+import SwiftUI
+
+/// Hält das aktive Dashboard-Layout für den Jobs-Screen und persistiert es als
+/// JSON in `UserDefaults`. Mutationen validieren das Raster (Clamping + Overlap)
+/// zentral, damit die View dumm bleiben kann.
+@MainActor
+final class DashboardStore: ObservableObject {
+    @Published private(set) var layout: DashboardLayout
+    /// Sprachneutrale Kennung des aktiven Presets (`DashboardPreset.rawValue`)
+    /// oder `customID` nach manueller Änderung — wird so persistiert, damit
+    /// ein Sprachwechsel den Vergleich/Anzeigenamen nicht bricht.
+    @Published private(set) var presetID: String
+
+    static let customID = "custom"
+    private static let layoutKey = "jobsDashboardLayout"
+    private static let presetKey = "jobsDashboardPreset"
+
+    /// Lokalisierter Anzeigename des aktiven Presets.
+    var presetName: String {
+        DashboardPreset(rawValue: presetID)?.label ?? String(localized: "Eigenes")
+    }
+
+    func isActive(_ preset: DashboardPreset) -> Bool { presetID == preset.rawValue }
+
+    init() {
+        let defaults = UserDefaults.standard
+        if let data = defaults.data(forKey: Self.layoutKey),
+           let decoded = try? JSONDecoder().decode(DashboardLayout.self, from: data),
+           !decoded.placements.isEmpty {
+            layout = Self.mergingClusterColumn(decoded)
+        } else {
+            layout = DashboardPreset.classic.layout
+        }
+        let stored = defaults.string(forKey: Self.presetKey) ?? DashboardPreset.classic.rawValue
+        // Migration: Früher wurde der deutsche Anzeigename persistiert.
+        let legacy = ["Klassisch": "classic", "Zwei Spalten": "twoColumn",
+                      "Fokus Jobs": "focusJobs", "Monitoring": "monitoring",
+                      "Eigenes": Self.customID]
+        if DashboardPreset(rawValue: stored) != nil || stored == Self.customID {
+            presetID = stored
+        } else {
+            presetID = legacy[stored] ?? Self.customID
+        }
+    }
+
+    /// Migration: Die frühere Dreier-Spalte (GPU-Belegung / Quotas / Stunden,
+    /// gestapelt mit gleicher x-Position und Breite) wird zum kombinierten
+    /// `.cluster`-Widget zusammengelegt — die Platzlogik (Belegung natürlich
+    /// hoch, Rest geteilt) lebt jetzt IM Widget. Horizontale Anordnungen
+    /// (Monitoring-Preset) bleiben unangetastet.
+    private static func mergingClusterColumn(_ layout: DashboardLayout) -> DashboardLayout {
+        guard layout.placement(for: .cluster) == nil else { return layout }
+        let parts: [DashboardWidget] = [.gpuAllocation, .diskQuotas, .gpuHours]
+        let found = layout.placements.filter { parts.contains($0.widget) }
+        guard found.count >= 2,
+              let first = found.first,
+              found.allSatisfy({ $0.frame.x == first.frame.x && $0.frame.w == first.frame.w })
+        else { return layout }
+
+        var result = layout
+        result.placements.removeAll { parts.contains($0.widget) }
+        let minY = found.map(\.frame.y).min() ?? 0
+        let maxY = found.map { $0.frame.y + $0.frame.h }.max() ?? 3
+        result.placements.append(.init(
+            widget: .cluster,
+            frame: .init(x: first.frame.x, y: minY, w: first.frame.w, h: maxY - minY)
+        ))
+        return result
+    }
+
+    // MARK: – Presets
+
+    func apply(_ preset: DashboardPreset) {
+        layout = preset.layout
+        presetID = preset.rawValue
+        persist()
+    }
+
+    func reset() { apply(.classic) }
+
+    // MARK: – Editor-Mutationen
+
+    /// Versucht, ein Widget auf einen neuen Rahmen zu setzen. Clamped ins Raster
+    /// und lehnt Überlappungen ab (Rückgabe `false` → View animiert zurück).
+    @discardableResult
+    func update(_ widget: DashboardWidget, to frame: WidgetFrame) -> Bool {
+        guard let idx = layout.placements.firstIndex(where: { $0.widget == widget }) else { return false }
+        var f = frame
+        let minSpan = widget.minSpan
+
+        // Größe ins Raster zwingen.
+        f.w = max(minSpan.w, min(f.w, layout.columns))
+        f.h = max(minSpan.h, f.h)
+        // Position clampen.
+        f.x = max(0, min(f.x, layout.columns - f.w))
+        f.y = max(0, f.y)
+
+        // Overlap gegen alle anderen prüfen.
+        let collides = layout.placements.contains { $0.widget != widget && $0.frame.intersects(f) }
+        if collides { return false }
+
+        guard f != layout.placements[idx].frame else { return true }
+        layout.placements[idx].frame = f
+        markCustom()
+        persist()
+        return true
+    }
+
+    /// Blendet ein Widget aus dem Layout aus.
+    func hide(_ widget: DashboardWidget) {
+        layout.placements.removeAll { $0.widget == widget }
+        markCustom()
+        persist()
+    }
+
+    /// Fügt ein verstecktes Widget wieder ein — sucht die erste freie Stelle.
+    func show(_ widget: DashboardWidget) {
+        guard layout.placement(for: widget) == nil else { return }
+        let span = widget.minSpan
+        let frame = firstFreeSlot(w: max(2, span.w), h: max(2, span.h))
+        layout.placements.append(.init(widget: widget, frame: frame))
+        markCustom()
+        persist()
+    }
+
+    func toggle(_ widget: DashboardWidget) {
+        if layout.placement(for: widget) == nil { show(widget) } else { hide(widget) }
+    }
+
+    // MARK: – Intern
+
+    private func markCustom() {
+        if presetID != Self.customID { presetID = Self.customID }
+    }
+
+    /// Erste rasterfreie Position (zeilenweise von oben), die `w×h` aufnimmt.
+    private func firstFreeSlot(w: Int, h: Int) -> WidgetFrame {
+        let cols = layout.columns
+        let width = min(w, cols)
+        var y = 0
+        while y < 256 { // harte Obergrenze
+            for x in 0...(cols - width) {
+                let candidate = WidgetFrame(x: x, y: y, w: width, h: h)
+                if !layout.placements.contains(where: { $0.frame.intersects(candidate) }) {
+                    return candidate
+                }
+            }
+            y += 1
+        }
+        return WidgetFrame(x: 0, y: layout.rows, w: width, h: h)
+    }
+
+    private func persist() {
+        if let data = try? JSONEncoder().encode(layout) {
+            UserDefaults.standard.set(data, forKey: Self.layoutKey)
+        }
+        UserDefaults.standard.set(presetID, forKey: Self.presetKey)
+    }
+}

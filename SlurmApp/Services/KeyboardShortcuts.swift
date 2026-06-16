@@ -8,7 +8,7 @@ import SwiftUI
 /// macOS-conventions (`⌘F`, `⌘1/2/3`, `⌘⌥0`) live alongside.
 enum Shortcut: String, CaseIterable, Identifiable {
     // App-wide
-    case quitApp
+    case quitApp           // ⌘Q — Standard-Quit über das System-Menü (bewusst KEIN bare `q`)
     case help
     case helpAlt           // `?`
     case focusSearch
@@ -33,6 +33,7 @@ enum Shortcut: String, CaseIterable, Identifiable {
     case bookmarkSelected
     case clearSelection
     case cyclePartition
+    case nodesOverview         // `G` — Knoten-Übersicht (alle Partitionen)
     case editScript
     case openTerminal
     case batchQos          // `p` — QoS der Auswahl ändern
@@ -74,7 +75,7 @@ enum Shortcut: String, CaseIterable, Identifiable {
             return .navigation
         case .refresh, .toggleAllUsers, .toggleAllUsersCmd, .toggleRunningOnly,
              .submitJob, .interactiveSession, .attachSelected, .cancelSelected,
-             .bookmarkSelected, .clearSelection, .cyclePartition,
+             .bookmarkSelected, .clearSelection, .cyclePartition, .nodesOverview,
              .editScript, .openTerminal, .batchQos, .batchPartition:
             return .jobs
         case .prevSortColumn, .prevSortColumnArrow,
@@ -115,6 +116,7 @@ enum Shortcut: String, CaseIterable, Identifiable {
         case .bookmarkSelected:         return "B"
         case .clearSelection:           return .escape
         case .cyclePartition:           return "g"
+        case .nodesOverview:            return "G"   // ⇧G
         case .editScript:               return "e"
         case .openTerminal:             return "t"
         case .batchQos:                 return "p"
@@ -143,11 +145,15 @@ enum Shortcut: String, CaseIterable, Identifiable {
     var modifiers: EventModifiers {
         switch self {
         case .toggleInspector:                              return [.command, .option]
+        // ⌘Q statt bare `q`: Ein einzelner versehentlicher Tastendruck darf
+        // nie die ganze App (samt SSH-Session) beenden — Quit läuft über die
+        // Standard-Konvention des System-Menüs.
+        case .quitApp:                                      return [.command]
         case .focusSearch:                                  return [.command]
         case .focusSidebar:                                 return [.command]
         case .toggleAllUsersCmd:                            return [.command, .shift]
         case .cancelSelected, .bookmarkSelected,
-             .copyActiveLog, .batchPartition:               return [.shift]
+             .copyActiveLog, .batchPartition, .nodesOverview: return [.shift]
         case .cursorTopCmd, .cursorBottomCmd:              return [.command]
         default:                                            return []
         }
@@ -201,49 +207,52 @@ enum Shortcut: String, CaseIterable, Identifiable {
         return s
     }
 
+    // String-Property lokalisiert nicht automatisch → explizit über den Katalog;
+    // das Help-Overlay (HelpOverlayView) zeigt diese Texte direkt an.
     var description: String {
         switch self {
-        case .quitApp:              return "App beenden"
-        case .help, .helpAlt:       return "Hilfe anzeigen"
-        case .focusSearch:          return "Suche fokussieren"
-        case .focusSidebar:         return "Sidebar fokussieren"
-        case .toggleInspector:      return "Inspector ein-/ausklappen"
-        case .sectionJobs:          return "Sektion: Jobs"
+        case .quitApp:              return String(localized: "App beenden")
+        case .help, .helpAlt:       return String(localized: "Hilfe anzeigen")
+        case .focusSearch:          return String(localized: "Suche fokussieren")
+        case .focusSidebar:         return String(localized: "Sidebar fokussieren")
+        case .toggleInspector:      return String(localized: "Inspector ein-/ausklappen")
+        case .sectionJobs:          return String(localized: "Sektion: Jobs")
         case .sectionBookmarks,
-             .openBookmarks:        return "Sektion: Marken"
-        case .sectionSettings:      return "Sektion: Settings"
-        case .refresh:              return "Aktualisieren"
+             .openBookmarks:        return String(localized: "Sektion: Lesezeichen")
+        case .sectionSettings:      return String(localized: "Sektion: Einstellungen")
+        case .refresh:              return String(localized: "Aktualisieren")
         case .toggleAllUsers,
-             .toggleAllUsersCmd:    return "Alle / meine Jobs"
-        case .toggleRunningOnly:    return "Nur running"
-        case .submitJob:            return "Neuer Batch-Job"
-        case .interactiveSession:   return "Interaktive Session"
-        case .attachSelected:       return "Attach zum Job"
-        case .cancelSelected:       return "Job abbrechen"
-        case .bookmarkSelected:     return "Job bookmarken"
-        case .clearSelection:       return "Auswahl / Modal schliessen"
-        case .cyclePartition:       return "Nächste Partition (Sheet)"
-        case .editScript:           return "Skript editieren (Terminal)"
-        case .openTerminal:         return "SSH-Shell in Terminal"
-        case .batchQos:             return "QoS ändern (Auswahl)"
-        case .batchPartition:       return "Partition ändern (Auswahl)"
+             .toggleAllUsersCmd:    return String(localized: "Alle / meine Jobs")
+        case .toggleRunningOnly:    return String(localized: "Nur laufende")
+        case .submitJob:            return String(localized: "Neuer Batch-Job")
+        case .interactiveSession:   return String(localized: "Interaktive Session")
+        case .attachSelected:       return String(localized: "Attach zum Job")
+        case .cancelSelected:       return String(localized: "Job beenden (scancel)")
+        case .bookmarkSelected:     return String(localized: "Lesezeichen setzen")
+        case .clearSelection:       return String(localized: "Auswahl / Modal schliessen")
+        case .cyclePartition:       return String(localized: "Nächste Partition (Sheet)")
+        case .nodesOverview:        return String(localized: "Knoten-Übersicht (alle Partitionen)")
+        case .editScript:           return String(localized: "Skript editieren (Terminal)")
+        case .openTerminal:         return String(localized: "SSH-Shell in Terminal")
+        case .batchQos:             return String(localized: "QoS ändern (Auswahl)")
+        case .batchPartition:       return String(localized: "Partition ändern (Auswahl)")
         case .prevSortColumn,
-             .prevSortColumnArrow:  return "Sort-Spalte zurück"
+             .prevSortColumnArrow:  return String(localized: "Sort-Spalte zurück")
         case .nextSortColumn,
-             .nextSortColumnArrow:  return "Sort-Spalte vor"
+             .nextSortColumnArrow:  return String(localized: "Sort-Spalte vor")
         case .toggleSortDir,
              .toggleSortDirAltS,
-             .toggleSortDirAltD:    return "Sort-Richtung toggle"
-        case .toggleFollow:         return "Log Follow-Mode"
-        case .focusLiveGpu:         return "Zur Live-GPU-Card"
-        case .focusLogs:            return "Zur Log-Card"
-        case .copyActiveLog:        return "Active Log kopieren"
-        case .toggleLogStream:      return "stderr/stdout umschalten"
+             .toggleSortDirAltD:    return String(localized: "Sort-Richtung toggle")
+        case .toggleFollow:         return String(localized: "Log Follow-Mode")
+        case .focusLiveGpu:         return String(localized: "Zur Live-GPU-Card")
+        case .focusLogs:            return String(localized: "Zur Log-Card")
+        case .copyActiveLog:        return String(localized: "Active Log kopieren")
+        case .toggleLogStream:      return String(localized: "stderr/stdout umschalten")
         case .cursorDownVim,
-             .cursorUpVim:          return "Cursor ↑/↓ (Vim)"
+             .cursorUpVim:          return String(localized: "Cursor ↑/↓ (Vim)")
         case .cursorTop, .cursorBottom,
              .cursorTopCmd, .cursorBottomCmd:
-                                    return "Erster / letzter Job"
+                                    return String(localized: "Erster / letzter Job")
         }
     }
 
@@ -253,6 +262,19 @@ enum Shortcut: String, CaseIterable, Identifiable {
         case jobs       = "Jobs"
         case sort       = "Sortieren"
         case detail     = "Job-Detail"
+
+        /// Anzeigename — der rawValue bleibt stabiler Identifier, die
+        /// Lokalisierung läuft über den Katalog (String-Property lokalisiert
+        /// nicht automatisch).
+        var label: String {
+            switch self {
+            case .navigation: return String(localized: "Navigation")
+            case .tableNav:   return String(localized: "Tabelle")
+            case .jobs:       return String(localized: "Jobs")
+            case .sort:       return String(localized: "Sortieren")
+            case .detail:     return String(localized: "Job-Detail")
+            }
+        }
     }
 }
 
